@@ -1,0 +1,305 @@
+#include <WiFiS3.h>
+#include <Wire.h>
+
+// ----------- WiFi credentials -----------
+const char* ssid = "Wifinity Home Network";
+const char* password = "nine7keep1total";
+const char* piServer = "192.168.1.136";
+
+// ----------- ThingSpeak -----------
+const char* server = "api.thingspeak.com";
+String apiKey = "NZDD8UEISXDDIT6E";
+
+WiFiClient client;
+
+// ----------- Pins -----------
+const int micPin = A0;       // sound
+const int lightPin = A1;     // light
+const int buttonPin = 2;     // button
+const int ledPin = 13;       // LED
+const int buzzerPin = 12;    // buzzer
+
+// ----------- Thresholds -----------
+int lightThreshold = 100;
+
+// ----------- State -----------
+bool panicLatched = false;
+bool fallLatched = false;
+bool buzzerAlreadyBeeped = false;
+bool eventSentToPi = false;
+
+// ----------- Timers -----------
+unsigned long lastSend = 0;
+const unsigned long sendIntervalMs = 15000;
+
+// ----------- Recording mode -----------
+bool recordingMode = false;
+unsigned long lastStreamSend = 0;
+const unsigned long streamIntervalMs = 100;  // 10 Hz
+bool recordingAutoStop = false;
+unsigned long recordingStartTime = 0;
+const unsigned long recordingDurationMs = 60000;
+
+// ----------- Button -----------
+int clickCount = 0;
+unsigned long clickStartTime = 0;
+bool lastButtonState = false;
+const unsigned long clickWindowMs = 900;
+
+unsigned long buttonHoldStart = 0;
+const unsigned long holdToCancelMs = 3000;
+
+// ----------- MPU6050 -----------
+const byte MPU_ADDR = 0x68;
+unsigned long lastImuSample = 0;
+const unsigned long imuSampleIntervalMs = 50;
+
+const uint64_t FREEFALL_MAG2 = 150000000ULL;
+const uint64_t IMPACT_MAG2   = 500000000ULL;
+const unsigned long FALL_WINDOW_MS = 1500;
+
+bool freeFallSeen = false;
+unsigned long freeFallTime = 0;
+unsigned long fallCooldownUntil = 0;
+const unsigned long fallCooldownMs = 4000;
+
+unsigned long fallLatchedTime = 0;
+const unsigned long fallLatchDurationMs = 15000;
+
+// ----------- Buzzer pattern -----------
+void beepPatternSOS(int pin) {
+  for (int block = 0; block < 3; block++) {
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(pin, HIGH);
+      delay(150);
+      digitalWrite(pin, LOW);
+      delay(150);
+    }
+    if (block < 2) delay(500);
+  }
+}
+
+// ----------- MPU helpers -----------
+void mpuWriteReg(byte reg, byte val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission(true);
+}
+
+int16_t mpuRead16(byte reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (byte)2);
+  byte hi = Wire.read();
+  byte lo = Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+void initMPU() {
+  Wire.begin();
+  mpuWriteReg(0x6B, 0x00);
+  mpuWriteReg(0x1C, 0x00);
+}
+
+// ----------- Send to Pi (non-blocking) -----------
+void sendToPi(int ax, int ay, int az, int eventCode) {
+  WiFiClient pi;
+  pi.setTimeout(200);
+
+  if (pi.connect(piServer, 5000)) {
+    pi.print("GET /data?ax=" + String(ax) +
+             "&ay=" + String(ay) +
+             "&az=" + String(az) +
+             "&event=" + String(eventCode) +
+             " HTTP/1.1\r\nHost: " + String(piServer) +
+             "\r\nConnection: close\r\n\r\n");
+  }
+  pi.stop();
+}
+
+// ✅ ThingSpeak (5 fields correct)
+void sendToThingSpeak(int soundValue, int lightValue, int buttonRaw, int eventCode, int systemStatus) {
+  WiFiClient ts;
+  ts.setTimeout(800);
+
+  if (ts.connect(server, 80)) {
+    String url = "/update?api_key=" + apiKey +
+                 "&field1=" + String(soundValue) +
+                 "&field2=" + String(lightValue) +
+                 "&field3=" + String(buttonRaw) +
+                 "&field4=" + String(eventCode) +
+                 "&field5=" + String(systemStatus);
+
+    ts.print(String("GET ") + url + " HTTP/1.1\r\n" +
+             "Host: " + server + "\r\n" +
+             "Connection: close\r\n\r\n");
+  }
+  ts.stop();
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(ledPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+
+  digitalWrite(ledPin, LOW);
+  digitalWrite(buzzerPin, LOW);
+
+  initMPU();
+
+  WiFi.begin(ssid, password);
+  Serial.println("Booting...");
+}
+
+void loop() {
+  int16_t ax = 0, ay = 0, az = 0;
+
+  // -------- Read sensors --------
+  int soundValue = analogRead(micPin);
+  int lightValue = analogRead(lightPin);
+  bool dark = (lightValue < lightThreshold);
+
+  // Button raw (pressed=1)
+  int buttonRaw = (digitalRead(buttonPin) == LOW) ? 1 : 0;
+  bool buttonNow = (buttonRaw == 1);
+
+  // Button multi-click handler (2 vs 3) + hold cancel
+  if (buttonNow && !lastButtonState) {
+    if (clickCount == 0) clickStartTime = millis();
+    clickCount++;
+  }
+
+  // Hold to cancel panic
+  if (buttonNow) {
+    if (buttonHoldStart == 0) buttonHoldStart = millis();
+    if (panicLatched && (millis() - buttonHoldStart > holdToCancelMs)) {
+      panicLatched = false;
+      buzzerAlreadyBeeped = false;
+      clickCount = 0;
+      Serial.println("✅ Panic cancelled (hold).");
+    }
+  } else {
+    buttonHoldStart = 0;
+  }
+
+  // Resolve click action when window expires
+  if (clickCount > 0 && (millis() - clickStartTime > clickWindowMs)) {
+
+    if (clickCount == 3) {
+      recordingMode = !recordingMode;
+      if (recordingMode) {
+        Serial.println("🎥 Recording mode: ON");
+        recordingStartTime = millis();
+      } else {
+        Serial.println("⛔ Recording mode: OFF");
+      }
+    }
+    else if (clickCount == 2) {
+      if (!recordingMode) {
+        panicLatched = true;
+        buzzerAlreadyBeeped = false;
+        Serial.println("🚨 Panic latched!");
+      }
+    }
+
+    clickCount = 0;
+  }
+
+  lastButtonState = buttonNow;
+
+  // -------- MPU sampling + fall detect --------
+  if (millis() - lastImuSample >= imuSampleIntervalMs) {
+    lastImuSample = millis();
+
+    ax = mpuRead16(0x3B);
+    ay = mpuRead16(0x3D);
+    az = mpuRead16(0x3F);
+
+    uint64_t mag2 = (uint64_t)ax*ax + (uint64_t)ay*ay + (uint64_t)az*az;
+    unsigned long now = millis();
+
+    if (now >= fallCooldownUntil) {
+      if (!freeFallSeen && mag2 < FREEFALL_MAG2) {
+        freeFallSeen = true;
+        freeFallTime = now;
+      }
+
+      if (freeFallSeen && mag2 > IMPACT_MAG2 && (now - freeFallTime) < FALL_WINDOW_MS) {
+        fallLatched = true;
+        fallLatchedTime = now;
+        buzzerAlreadyBeeped = false;
+        freeFallSeen = false;
+        fallCooldownUntil = now + fallCooldownMs;
+        Serial.println("⚠️ FALL CONFIRMED.");
+      }
+
+      if (freeFallSeen && (now - freeFallTime) > FALL_WINDOW_MS) {
+        freeFallSeen = false;
+      }
+    }
+  }
+
+  if (fallLatched && (millis() - fallLatchedTime > fallLatchDurationMs)) {
+    fallLatched = false;
+  }
+
+  // -------- Event code --------
+  int eventCode = 0;     // 0 normal
+  if (dark) eventCode = 3;  // 3 dark
+  if (fallLatched) eventCode = 1; // fall
+  if (panicLatched) eventCode = 4;  //button_panic
+
+  // SystemStatus en field5: 0 normal / 1 recordingMode
+  int systemStatus = recordingMode ? 1 : 0;
+
+  // -------- LED immediate --------
+  digitalWrite(ledPin, (eventCode != 0) ? HIGH : LOW);
+
+  // -------- Buzzer immediate --------
+  if ((eventCode == 1 || eventCode == 4) && !buzzerAlreadyBeeped) {
+    beepPatternSOS(buzzerPin);
+    buzzerAlreadyBeeped = true;
+  }
+
+  // -------- Send to Pi --------
+  unsigned long nowMs = millis();
+
+  if (recordingMode) {
+    if (recordingAutoStop && (nowMs - recordingStartTime > recordingDurationMs)) {
+      recordingMode = false;
+      Serial.println("🛑 Recording auto-stopped.");
+    }
+
+    if (nowMs - lastStreamSend >= streamIntervalMs) {
+      lastStreamSend = nowMs;
+      sendToPi(ax, ay, az, 9); // streaming sample
+    }
+
+    eventSentToPi = false;
+  } else {
+    if ((eventCode == 1 || eventCode == 4) && !eventSentToPi) {
+      sendToPi(ax, ay, az, eventCode);
+      eventSentToPi = true;
+    }
+    if (eventCode == 0) eventSentToPi = false;
+  }
+
+  // -------- Send to ThingSpeak every X seconds --------
+  if (millis() - lastSend > sendIntervalMs) {
+    lastSend = millis();
+
+    sendToThingSpeak(soundValue, lightValue, buttonRaw, eventCode, systemStatus);
+
+    Serial.print("Sound="); Serial.print(soundValue);
+    Serial.print(" | Light="); Serial.print(lightValue);
+    Serial.print(" | Button="); Serial.print(buttonRaw);
+    Serial.print(" | Event="); Serial.print(eventCode);
+    Serial.print(" | Status="); Serial.println(systemStatus);
+  }
+
+  delay(10);
+}
