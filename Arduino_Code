@@ -2,13 +2,13 @@
 #include <Wire.h>
 
 // ----------- WiFi credentials -----------
-const char* ssid = "Wifinity Home Network";
-const char* password = "nine7keep1total";
-const char* piServer = "192.168.1.136";
+const char* ssid = "SSID";
+const char* password = "password";
+const char* piServer = "Pi_IP";
 
 // ----------- ThingSpeak -----------
 const char* server = "api.thingspeak.com";
-String apiKey = "NZDD8UEISXDDIT6E";
+String apiKey = "PRIVATE KEY";
 
 WiFiClient client;
 
