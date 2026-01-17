@@ -18,7 +18,6 @@ The system is composed of:
 ## Repository Structure
 - `/arduino`: Arduino firmware
 - `/raspberry-pi`: Edge AI and server scripts
-- `/diagrams`: System architecture diagrams
 
 ## Author
 Lucas Garrido Garcés
